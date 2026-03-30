@@ -1,0 +1,981 @@
+(() => {
+  'use strict';
+
+  const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const KEYBOARD_MAPPING = [
+    { key: 'a', note: 60 },
+    { key: 'w', note: 61 },
+    { key: 's', note: 62 },
+    { key: 'e', note: 63 },
+    { key: 'd', note: 64 },
+    { key: 'f', note: 65 },
+    { key: 't', note: 66 },
+    { key: 'g', note: 67 },
+    { key: 'y', note: 68 },
+    { key: 'h', note: 69 },
+    { key: 'u', note: 70 },
+    { key: 'j', note: 71 },
+    { key: 'k', note: 72 },
+  ];
+
+  const ui = {
+    startAudioBtn: document.getElementById('startAudioBtn'),
+    playBtn: document.getElementById('playBtn'),
+    stopBtn: document.getElementById('stopBtn'),
+    loopToggle: document.getElementById('loopToggle'),
+    waveform: document.getElementById('waveform'),
+    cutoff: document.getElementById('cutoff'),
+    resonance: document.getElementById('resonance'),
+    attack: document.getElementById('attack'),
+    decay: document.getElementById('decay'),
+    sustain: document.getElementById('sustain'),
+    release: document.getElementById('release'),
+    lfoTarget: document.getElementById('lfoTarget'),
+    lfoRate: document.getElementById('lfoRate'),
+    lfoDepth: document.getElementById('lfoDepth'),
+    masterVolume: document.getElementById('masterVolume'),
+    cutoffValue: document.getElementById('cutoffValue'),
+    resonanceValue: document.getElementById('resonanceValue'),
+    attackValue: document.getElementById('attackValue'),
+    decayValue: document.getElementById('decayValue'),
+    sustainValue: document.getElementById('sustainValue'),
+    releaseValue: document.getElementById('releaseValue'),
+    lfoRateValue: document.getElementById('lfoRateValue'),
+    lfoDepthValue: document.getElementById('lfoDepthValue'),
+    masterVolumeValue: document.getElementById('masterVolumeValue'),
+    keyboard: document.getElementById('keyboard'),
+    midiFileInput: document.getElementById('midiFileInput'),
+    midiInputSelect: document.getElementById('midiInputSelect'),
+    refreshMidiBtn: document.getElementById('refreshMidiBtn'),
+    clearMidiBtn: document.getElementById('clearMidiBtn'),
+    audioStatus: document.getElementById('audioStatus'),
+    midiStatus: document.getElementById('midiStatus'),
+    fileStatus: document.getElementById('fileStatus'),
+    transportStatus: document.getElementById('transportStatus'),
+    waveCanvas: document.getElementById('waveCanvas'),
+    fftCanvas: document.getElementById('fftCanvas'),
+    pianoRollCanvas: document.getElementById('pianoRollCanvas'),
+    summaryList: document.getElementById('summaryList'),
+    trackList: document.getElementById('trackList'),
+  };
+
+  const state = {
+    audioContext: null,
+    analyser: null,
+    analyserTimeData: null,
+    analyserFreqData: null,
+    masterGain: null,
+    voices: new Map(),
+    midiAccess: null,
+    activeMidiInput: null,
+    importedMidi: null,
+    recordedNotes: [],
+    recordingActiveNotes: new Map(),
+    playTimeouts: [],
+    loopTimeout: null,
+    playStartPerf: 0,
+    playDurationSec: 0,
+    transportRaf: 0,
+    isPlaying: false,
+    pianoKeyElements: new Map(),
+  };
+
+  function formatNoteNumber(note) {
+    const octave = Math.floor(note / 12) - 1;
+    return `${NOTE_NAMES[note % 12]}${octave}`;
+  }
+
+  function noteToFrequency(note) {
+    return 440 * Math.pow(2, (note - 69) / 12);
+  }
+
+  function getSynthSettings() {
+    return {
+      waveform: ui.waveform.value,
+      cutoff: Number(ui.cutoff.value),
+      resonance: Number(ui.resonance.value),
+      attack: Number(ui.attack.value),
+      decay: Number(ui.decay.value),
+      sustain: Number(ui.sustain.value),
+      release: Number(ui.release.value),
+      lfoTarget: ui.lfoTarget.value,
+      lfoRate: Number(ui.lfoRate.value),
+      lfoDepth: Number(ui.lfoDepth.value),
+      masterVolume: Number(ui.masterVolume.value),
+    };
+  }
+
+  function updateOutputs() {
+    ui.cutoffValue.textContent = `${Math.round(Number(ui.cutoff.value))} Hz`;
+    ui.resonanceValue.textContent = Number(ui.resonance.value).toFixed(1);
+    ui.attackValue.textContent = `${Number(ui.attack.value).toFixed(3)} s`;
+    ui.decayValue.textContent = `${Number(ui.decay.value).toFixed(3)} s`;
+    ui.sustainValue.textContent = Number(ui.sustain.value).toFixed(2);
+    ui.releaseValue.textContent = `${Number(ui.release.value).toFixed(2)} s`;
+    ui.lfoRateValue.textContent = `${Number(ui.lfoRate.value).toFixed(1)} Hz`;
+    ui.lfoDepthValue.textContent = Number(ui.lfoDepth.value).toFixed(2);
+    ui.masterVolumeValue.textContent = Number(ui.masterVolume.value).toFixed(2);
+
+    if (state.masterGain) {
+      state.masterGain.gain.setTargetAtTime(Number(ui.masterVolume.value), state.audioContext.currentTime, 0.015);
+    }
+  }
+
+  function ensureAudio() {
+    if (state.audioContext) {
+      return state.audioContext;
+    }
+
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      throw new Error('Web Audio APIに未対応です。');
+    }
+
+    const context = new AudioContextClass();
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.85;
+
+    const masterGain = context.createGain();
+    masterGain.gain.value = Number(ui.masterVolume.value);
+
+    masterGain.connect(analyser);
+    analyser.connect(context.destination);
+
+    state.audioContext = context;
+    state.masterGain = masterGain;
+    state.analyser = analyser;
+    state.analyserTimeData = new Uint8Array(analyser.fftSize);
+    state.analyserFreqData = new Uint8Array(analyser.frequencyBinCount);
+    ui.audioStatus.textContent = context.state;
+
+    context.onstatechange = () => {
+      ui.audioStatus.textContent = context.state;
+    };
+
+    startVisualizers();
+    return context;
+  }
+
+  async function startAudio() {
+    const context = ensureAudio();
+    if (context.state === 'suspended') {
+      await context.resume();
+    }
+    ui.audioStatus.textContent = context.state;
+  }
+
+  function createVoice(note, velocity = 100) {
+    const context = ensureAudio();
+    const settings = getSynthSettings();
+    const now = context.currentTime;
+    const voiceGain = context.createGain();
+    const filter = context.createBiquadFilter();
+    const osc = context.createOscillator();
+
+    osc.type = settings.waveform;
+    osc.frequency.value = noteToFrequency(note);
+
+    filter.type = 'lowpass';
+    filter.frequency.value = settings.cutoff;
+    filter.Q.value = settings.resonance;
+
+    const velocityGain = Math.max(0.05, Math.min(1, velocity / 127));
+    voiceGain.gain.cancelScheduledValues(now);
+    voiceGain.gain.setValueAtTime(0.0001, now);
+    voiceGain.gain.linearRampToValueAtTime(velocityGain, now + settings.attack);
+    voiceGain.gain.linearRampToValueAtTime(velocityGain * settings.sustain, now + settings.attack + settings.decay);
+
+    let lfoOsc = null;
+    let lfoAmount = null;
+    if (settings.lfoTarget !== 'none' && settings.lfoDepth > 0) {
+      lfoOsc = context.createOscillator();
+      lfoOsc.frequency.value = settings.lfoRate;
+      lfoAmount = context.createGain();
+
+      if (settings.lfoTarget === 'filter') {
+        lfoAmount.gain.value = settings.lfoDepth * 3000;
+        lfoOsc.connect(lfoAmount).connect(filter.frequency);
+      } else if (settings.lfoTarget === 'pitch') {
+        lfoAmount.gain.value = settings.lfoDepth * 45;
+        lfoOsc.connect(lfoAmount).connect(osc.detune);
+      } else if (settings.lfoTarget === 'gain') {
+        lfoAmount.gain.value = settings.lfoDepth * 0.25;
+        lfoOsc.connect(lfoAmount).connect(voiceGain.gain);
+      }
+    }
+
+    osc.connect(filter).connect(voiceGain).connect(state.masterGain);
+    osc.start(now);
+    if (lfoOsc) {
+      lfoOsc.start(now);
+    }
+
+    return {
+      note,
+      osc,
+      filter,
+      gain: voiceGain,
+      lfoOsc,
+      lfoAmount,
+      releaseTime: settings.release,
+      startedAt: now,
+    };
+  }
+
+  function noteOn(note, velocity = 100) {
+    startAudio().catch(() => {});
+    if (state.voices.has(note)) {
+      noteOff(note);
+    }
+    const voice = createVoice(note, velocity);
+    state.voices.set(note, voice);
+    setKeyActive(note, true);
+  }
+
+  function noteOff(note) {
+    const voice = state.voices.get(note);
+    if (!voice || !state.audioContext) {
+      setKeyActive(note, false);
+      return;
+    }
+
+    const now = state.audioContext.currentTime;
+    voice.gain.gain.cancelScheduledValues(now);
+    const current = Math.max(voice.gain.gain.value, 0.0001);
+    voice.gain.gain.setValueAtTime(current, now);
+    voice.gain.gain.exponentialRampToValueAtTime(0.0001, now + voice.releaseTime);
+    voice.osc.stop(now + voice.releaseTime + 0.05);
+    if (voice.lfoOsc) {
+      voice.lfoOsc.stop(now + voice.releaseTime + 0.05);
+    }
+
+    state.voices.delete(note);
+    setKeyActive(note, false);
+  }
+
+  function allNotesOff() {
+    const notes = Array.from(state.voices.keys());
+    for (const note of notes) {
+      noteOff(note);
+    }
+  }
+
+  function createKeyboard() {
+    const startNote = 60;
+    const endNote = 72;
+    const whiteNotes = [];
+    for (let note = startNote; note <= endNote; note += 1) {
+      if (!NOTE_NAMES[note % 12].includes('#')) {
+        whiteNotes.push(note);
+      }
+    }
+
+    ui.keyboard.innerHTML = '';
+    const whitePositions = new Map();
+    whiteNotes.forEach((note, index) => {
+      const key = document.createElement('button');
+      key.type = 'button';
+      key.className = 'key white';
+      key.dataset.note = String(note);
+      key.textContent = formatNoteNumber(note);
+      whitePositions.set(note, index * 54);
+      attachPointerNoteEvents(key, note);
+      ui.keyboard.appendChild(key);
+      state.pianoKeyElements.set(note, key);
+    });
+
+    for (let note = startNote; note <= endNote; note += 1) {
+      if (!NOTE_NAMES[note % 12].includes('#')) continue;
+      const prevWhite = note - 1;
+      const key = document.createElement('button');
+      key.type = 'button';
+      key.className = 'key black';
+      key.dataset.note = String(note);
+      key.textContent = formatNoteNumber(note);
+      const left = (whitePositions.get(prevWhite) ?? 0) + 36;
+      key.style.left = `${left}px`;
+      attachPointerNoteEvents(key, note);
+      ui.keyboard.appendChild(key);
+      state.pianoKeyElements.set(note, key);
+    }
+  }
+
+  function attachPointerNoteEvents(element, note) {
+    const downHandler = (event) => {
+      event.preventDefault();
+      noteOn(note, 110);
+    };
+    const upHandler = (event) => {
+      event.preventDefault();
+      noteOff(note);
+    };
+
+    element.addEventListener('mousedown', downHandler);
+    element.addEventListener('mouseup', upHandler);
+    element.addEventListener('mouseleave', upHandler);
+    element.addEventListener('touchstart', downHandler, { passive: false });
+    element.addEventListener('touchend', upHandler, { passive: false });
+  }
+
+  function setKeyActive(note, active) {
+    const element = state.pianoKeyElements.get(note);
+    if (!element) return;
+    element.classList.toggle('active', active);
+  }
+
+  function setupPcKeyboard() {
+    const activeKeys = new Set();
+    const keyToNote = new Map(KEYBOARD_MAPPING.map((item) => [item.key, item.note]));
+
+    window.addEventListener('keydown', (event) => {
+      const key = event.key.toLowerCase();
+      const note = keyToNote.get(key);
+      if (!note || activeKeys.has(key)) return;
+      activeKeys.add(key);
+      noteOn(note, 108);
+    });
+
+    window.addEventListener('keyup', (event) => {
+      const key = event.key.toLowerCase();
+      const note = keyToNote.get(key);
+      if (!note) return;
+      activeKeys.delete(key);
+      noteOff(note);
+    });
+  }
+
+  function startVisualizers() {
+    const waveCtx = ui.waveCanvas.getContext('2d');
+    const fftCtx = ui.fftCanvas.getContext('2d');
+
+    function draw() {
+      if (!state.analyser) {
+        state.transportRaf = requestAnimationFrame(draw);
+        return;
+      }
+
+      const waveCanvas = ui.waveCanvas;
+      const fftCanvas = ui.fftCanvas;
+      const w = waveCanvas.width;
+      const h = waveCanvas.height;
+      const fw = fftCanvas.width;
+      const fh = fftCanvas.height;
+
+      state.analyser.getByteTimeDomainData(state.analyserTimeData);
+      state.analyser.getByteFrequencyData(state.analyserFreqData);
+
+      waveCtx.clearRect(0, 0, w, h);
+      waveCtx.fillStyle = '#08111f';
+      waveCtx.fillRect(0, 0, w, h);
+      waveCtx.strokeStyle = 'rgba(105,168,255,0.18)';
+      waveCtx.lineWidth = 1;
+      for (let i = 0; i <= 4; i += 1) {
+        const y = (h / 4) * i;
+        waveCtx.beginPath();
+        waveCtx.moveTo(0, y);
+        waveCtx.lineTo(w, y);
+        waveCtx.stroke();
+      }
+      waveCtx.beginPath();
+      waveCtx.strokeStyle = '#8fe0c2';
+      waveCtx.lineWidth = 2;
+      for (let i = 0; i < state.analyserTimeData.length; i += 1) {
+        const x = (i / (state.analyserTimeData.length - 1)) * w;
+        const y = (state.analyserTimeData[i] / 255) * h;
+        if (i === 0) waveCtx.moveTo(x, y);
+        else waveCtx.lineTo(x, y);
+      }
+      waveCtx.stroke();
+
+      fftCtx.clearRect(0, 0, fw, fh);
+      fftCtx.fillStyle = '#08111f';
+      fftCtx.fillRect(0, 0, fw, fh);
+      fftCtx.strokeStyle = 'rgba(105,168,255,0.14)';
+      fftCtx.lineWidth = 1;
+      for (let i = 0; i <= 4; i += 1) {
+        const y = (fh / 4) * i;
+        fftCtx.beginPath();
+        fftCtx.moveTo(0, y);
+        fftCtx.lineTo(fw, y);
+        fftCtx.stroke();
+      }
+      const barWidth = fw / state.analyserFreqData.length;
+      for (let i = 0; i < state.analyserFreqData.length; i += 1) {
+        const magnitude = state.analyserFreqData[i] / 255;
+        const barHeight = magnitude * (fh - 12);
+        const x = i * barWidth;
+        fftCtx.fillStyle = `rgba(${80 + Math.round(magnitude * 100)}, ${120 + Math.round(magnitude * 100)}, 255, 0.95)`;
+        fftCtx.fillRect(x, fh - barHeight, Math.max(1, barWidth), barHeight);
+      }
+
+      state.transportRaf = requestAnimationFrame(draw);
+    }
+
+    cancelAnimationFrame(state.transportRaf);
+    state.transportRaf = requestAnimationFrame(draw);
+  }
+
+  async function initMidi() {
+    if (!navigator.requestMIDIAccess) {
+      ui.midiStatus.textContent = 'Web MIDI APIに未対応';
+      return;
+    }
+
+    try {
+      state.midiAccess = await navigator.requestMIDIAccess();
+      populateMidiInputs();
+      ui.midiStatus.textContent = `入力数 ${state.midiAccess.inputs.size}`;
+      state.midiAccess.onstatechange = () => {
+        populateMidiInputs();
+        ui.midiStatus.textContent = `入力数 ${state.midiAccess.inputs.size}`;
+      };
+    } catch (error) {
+      ui.midiStatus.textContent = `MIDI利用不可: ${error.message}`;
+    }
+  }
+
+  function populateMidiInputs() {
+    ui.midiInputSelect.innerHTML = '<option value="">未選択</option>';
+    if (!state.midiAccess) return;
+
+    for (const input of state.midiAccess.inputs.values()) {
+      const option = document.createElement('option');
+      option.value = input.id;
+      option.textContent = `${input.name || '名称なし'} (${input.manufacturer || 'MIDI'})`;
+      ui.midiInputSelect.appendChild(option);
+    }
+  }
+
+  function setActiveMidiInput(id) {
+    if (!state.midiAccess) return;
+
+    if (state.activeMidiInput) {
+      state.activeMidiInput.onmidimessage = null;
+      state.activeMidiInput = null;
+    }
+
+    if (!id) {
+      ui.midiStatus.textContent = `入力数 ${state.midiAccess.inputs.size}`;
+      return;
+    }
+
+    const input = state.midiAccess.inputs.get(id);
+    if (!input) return;
+
+    input.onmidimessage = handleMidiMessage;
+    state.activeMidiInput = input;
+    ui.midiStatus.textContent = `接続中: ${input.name || '名称なし'}`;
+  }
+
+  function handleMidiMessage(event) {
+    const [status, data1, data2] = event.data;
+    const command = status & 0xf0;
+    if (command === 0x90 && data2 > 0) {
+      noteOn(data1, data2);
+    } else if (command === 0x80 || (command === 0x90 && data2 === 0)) {
+      noteOff(data1);
+    }
+  }
+
+  function readVarInt(view, offsetRef) {
+    let result = 0;
+    while (offsetRef.value < view.byteLength) {
+      const byte = view.getUint8(offsetRef.value);
+      offsetRef.value += 1;
+      result = (result << 7) | (byte & 0x7f);
+      if ((byte & 0x80) === 0) break;
+    }
+    return result;
+  }
+
+  function getTempoAtTick(tempoMap, tick) {
+    let currentTempo = 500000;
+    for (const item of tempoMap) {
+      if (item.tick <= tick) currentTempo = item.microsecondsPerBeat;
+      else break;
+    }
+    return currentTempo;
+  }
+
+  function tickToSeconds(tick, ticksPerBeat, tempoMap) {
+    const sorted = [...tempoMap].sort((a, b) => a.tick - b.tick);
+    let seconds = 0;
+    let lastTick = 0;
+    let currentTempo = sorted.length > 0 ? sorted[0].microsecondsPerBeat : 500000;
+
+    for (const change of sorted) {
+      if (change.tick >= tick) break;
+      const deltaTicks = change.tick - lastTick;
+      seconds += (deltaTicks / ticksPerBeat) * (currentTempo / 1000000);
+      currentTempo = change.microsecondsPerBeat;
+      lastTick = change.tick;
+    }
+
+    const remainingTicks = tick - lastTick;
+    seconds += (remainingTicks / ticksPerBeat) * (currentTempo / 1000000);
+    return seconds;
+  }
+
+  function parseMidi(arrayBuffer, fileName = 'unknown.mid') {
+    const view = new DataView(arrayBuffer);
+    let offset = 0;
+
+    function readString(length) {
+      let text = '';
+      for (let i = 0; i < length; i += 1) {
+        text += String.fromCharCode(view.getUint8(offset + i));
+      }
+      offset += length;
+      return text;
+    }
+
+    function readUint32() {
+      const value = view.getUint32(offset);
+      offset += 4;
+      return value;
+    }
+
+    function readUint16() {
+      const value = view.getUint16(offset);
+      offset += 2;
+      return value;
+    }
+
+    const chunkType = readString(4);
+    if (chunkType !== 'MThd') {
+      throw new Error('MIDIヘッダが見つかりません。');
+    }
+
+    const headerLength = readUint32();
+    const formatType = readUint16();
+    const trackCount = readUint16();
+    const division = readUint16();
+    offset += Math.max(0, headerLength - 6);
+
+    if (division & 0x8000) {
+      throw new Error('SMPTE division は未対応です。');
+    }
+
+    const tempoMap = [{ tick: 0, microsecondsPerBeat: 500000 }];
+    const timeSignatures = [];
+    const tracks = [];
+    const notes = [];
+
+    for (let trackIndex = 0; trackIndex < trackCount; trackIndex += 1) {
+      const trackType = readString(4);
+      if (trackType !== 'MTrk') {
+        throw new Error(`MTrk が見つかりません (track ${trackIndex}).`);
+      }
+      const trackLength = readUint32();
+      const trackEnd = offset + trackLength;
+      let tick = 0;
+      let runningStatus = null;
+      let trackName = `Track ${trackIndex + 1}`;
+      const activeNotes = new Map();
+      let noteCount = 0;
+
+      while (offset < trackEnd) {
+        const offsetRef = { value: offset };
+        const delta = readVarInt(view, offsetRef);
+        offset = offsetRef.value;
+        tick += delta;
+
+        let statusByte = view.getUint8(offset);
+        if (statusByte < 0x80) {
+          if (runningStatus === null) {
+            throw new Error('Running status の解析に失敗しました。');
+          }
+          statusByte = runningStatus;
+        } else {
+          offset += 1;
+          runningStatus = statusByte;
+        }
+
+        if (statusByte === 0xff) {
+          const metaType = view.getUint8(offset);
+          offset += 1;
+          const lenRef = { value: offset };
+          const metaLength = readVarInt(view, lenRef);
+          offset = lenRef.value;
+
+          if (metaType === 0x03) {
+            let text = '';
+            for (let i = 0; i < metaLength; i += 1) {
+              text += String.fromCharCode(view.getUint8(offset + i));
+            }
+            trackName = text || trackName;
+          } else if (metaType === 0x51 && metaLength === 3) {
+            const microsecondsPerBeat =
+              (view.getUint8(offset) << 16) |
+              (view.getUint8(offset + 1) << 8) |
+              view.getUint8(offset + 2);
+            tempoMap.push({ tick, microsecondsPerBeat });
+          } else if (metaType === 0x58 && metaLength >= 2) {
+            const numerator = view.getUint8(offset);
+            const denominator = Math.pow(2, view.getUint8(offset + 1));
+            timeSignatures.push({ tick, numerator, denominator });
+          }
+
+          offset += metaLength;
+          continue;
+        }
+
+        if (statusByte === 0xf0 || statusByte === 0xf7) {
+          const lenRef = { value: offset };
+          const sysexLength = readVarInt(view, lenRef);
+          offset = lenRef.value + sysexLength;
+          continue;
+        }
+
+        const eventType = statusByte & 0xf0;
+        const channel = statusByte & 0x0f;
+        const firstData = view.getUint8(offset);
+        offset += 1;
+        const secondDataNeeded = ![0xc0, 0xd0].includes(eventType);
+        const secondData = secondDataNeeded ? view.getUint8(offset) : 0;
+        if (secondDataNeeded) offset += 1;
+
+        if (eventType === 0x90 && secondData > 0) {
+          activeNotes.set(`${channel}:${firstData}`, {
+            startTick: tick,
+            velocity: secondData,
+            channel,
+          });
+        } else if (eventType === 0x80 || (eventType === 0x90 && secondData === 0)) {
+          const key = `${channel}:${firstData}`;
+          const active = activeNotes.get(key);
+          if (active) {
+            notes.push({
+              pitch: firstData,
+              startTick: active.startTick,
+              durationTick: Math.max(1, tick - active.startTick),
+              velocity: active.velocity,
+              trackIndex,
+              channel,
+              trackName,
+            });
+            noteCount += 1;
+            activeNotes.delete(key);
+          }
+        }
+      }
+
+      tracks.push({
+        index: trackIndex,
+        name: trackName,
+        noteCount,
+      });
+      offset = trackEnd;
+    }
+
+    const sortedTempoMap = tempoMap.sort((a, b) => a.tick - b.tick);
+    const ticksPerBeat = division;
+    let maxTick = 0;
+    notes.forEach((note) => {
+      note.startSec = tickToSeconds(note.startTick, ticksPerBeat, sortedTempoMap);
+      note.durationSec = tickToSeconds(note.startTick + note.durationTick, ticksPerBeat, sortedTempoMap) - note.startSec;
+      maxTick = Math.max(maxTick, note.startTick + note.durationTick);
+    });
+
+    const firstTempo = sortedTempoMap[0]?.microsecondsPerBeat ?? 500000;
+    const bpm = Math.round(60000000 / firstTempo);
+    const timeSignature = timeSignatures[0]
+      ? `${timeSignatures[0].numerator}/${timeSignatures[0].denominator}`
+      : '4/4';
+
+    return {
+      fileName,
+      formatType,
+      trackCount,
+      ticksPerBeat,
+      bpm,
+      timeSignature,
+      tempoMap: sortedTempoMap,
+      tracks,
+      notes,
+      durationTick: maxTick,
+      durationSec: tickToSeconds(maxTick, ticksPerBeat, sortedTempoMap),
+    };
+  }
+
+  function updateMidiSummary() {
+    if (!state.importedMidi) {
+      ui.summaryList.innerHTML = `
+        <li>テンポ: -</li>
+        <li>拍子: -</li>
+        <li>トラック数: -</li>
+        <li>ノート数: -</li>
+        <li>長さ: -</li>
+      `;
+      ui.trackList.textContent = 'MIDIを読むと表示';
+      ui.trackList.className = 'track-list empty';
+      return;
+    }
+
+    const midi = state.importedMidi;
+    ui.summaryList.innerHTML = `
+      <li>テンポ: ${midi.bpm} BPM</li>
+      <li>拍子: ${midi.timeSignature}</li>
+      <li>トラック数: ${midi.trackCount}</li>
+      <li>ノート数: ${midi.notes.length}</li>
+      <li>長さ: ${midi.durationSec.toFixed(2)} s</li>
+    `;
+
+    ui.trackList.innerHTML = '';
+    ui.trackList.className = 'track-list';
+    midi.tracks.forEach((track) => {
+      const item = document.createElement('div');
+      item.className = 'track-item';
+      item.innerHTML = `
+        <span class="name">${escapeHtml(track.name)}</span>
+        <span class="meta">Track ${track.index + 1} / notes ${track.noteCount}</span>
+      `;
+      ui.trackList.appendChild(item);
+    });
+  }
+
+  function escapeHtml(text) {
+    return String(text)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  function renderPianoRoll() {
+    const canvas = ui.pianoRollCanvas;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#08111f';
+    ctx.fillRect(0, 0, width, height);
+
+    const importedNotes = state.importedMidi?.notes ?? [];
+    const allNotes = [...importedNotes, ...state.recordedNotes];
+    if (allNotes.length === 0) {
+      ctx.fillStyle = '#a7b4d0';
+      ctx.font = '16px sans-serif';
+      ctx.fillText('MIDIを読むか鍵盤を弾くとここにノートが表示されます。', 24, 32);
+      return;
+    }
+
+    const minPitch = Math.min(...allNotes.map((note) => note.pitch), 48);
+    const maxPitch = Math.max(...allNotes.map((note) => note.pitch), 84);
+    const pitchRange = maxPitch - minPitch + 1;
+    const totalTicks = Math.max(state.importedMidi?.durationTick ?? 0, ...state.recordedNotes.map((note) => note.startTick + note.durationTick), 1);
+    const rowHeight = height / pitchRange;
+
+    ctx.strokeStyle = 'rgba(105,168,255,0.12)';
+    ctx.lineWidth = 1;
+    for (let p = 0; p <= pitchRange; p += 1) {
+      const y = p * rowHeight;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+    }
+
+    const beatTicks = state.importedMidi?.ticksPerBeat ?? 480;
+    for (let tick = 0; tick <= totalTicks; tick += beatTicks) {
+      const x = (tick / totalTicks) * width;
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(143,224,194,0.16)';
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+    }
+
+    for (const note of importedNotes) {
+      drawNoteRect(ctx, note, totalTicks, minPitch, pitchRange, width, height, 'rgba(105,168,255,0.88)');
+    }
+
+    for (const note of state.recordedNotes) {
+      drawNoteRect(ctx, note, totalTicks, minPitch, pitchRange, width, height, 'rgba(255,176,107,0.95)');
+    }
+
+    ctx.fillStyle = '#a7b4d0';
+    ctx.font = '12px sans-serif';
+    for (let p = minPitch; p <= maxPitch; p += 12) {
+      const y = height - ((p - minPitch + 1) / pitchRange) * height + 12;
+      ctx.fillText(formatNoteNumber(p), 8, y);
+    }
+  }
+
+  function drawNoteRect(ctx, note, totalTicks, minPitch, pitchRange, width, height, color) {
+    const x = (note.startTick / totalTicks) * width;
+    const w = Math.max(2, (note.durationTick / totalTicks) * width);
+    const y = height - ((note.pitch - minPitch + 1) / pitchRange) * height;
+    const h = Math.max(4, height / pitchRange - 1);
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y, w, h);
+  }
+
+  function recordManualNoteStart(note, velocity = 110) {
+    const startTick = (state.recordedNotes.length > 0
+      ? state.recordedNotes[state.recordedNotes.length - 1].startTick + state.recordedNotes[state.recordedNotes.length - 1].durationTick
+      : 0);
+    state.recordingActiveNotes.set(note, {
+      startTick,
+      velocity,
+    });
+  }
+
+  function recordManualNoteStop(note) {
+    const active = state.recordingActiveNotes.get(note);
+    if (!active) return;
+    state.recordedNotes.push({
+      pitch: note,
+      startTick: active.startTick,
+      durationTick: 240,
+      velocity: active.velocity,
+      trackIndex: -1,
+      channel: 0,
+      trackName: 'Manual Input',
+    });
+    state.recordingActiveNotes.delete(note);
+    renderPianoRoll();
+  }
+
+  function playImportedMidi() {
+    if (!state.importedMidi || state.importedMidi.notes.length === 0) {
+      ui.fileStatus.textContent = '再生するMIDIがありません';
+      return;
+    }
+    stopPlayback();
+    startAudio().catch(() => {});
+    state.isPlaying = true;
+    state.playStartPerf = performance.now();
+    state.playDurationSec = state.importedMidi.durationSec;
+
+    state.importedMidi.notes.forEach((note) => {
+      const startId = window.setTimeout(() => {
+        noteOn(note.pitch, note.velocity);
+      }, note.startSec * 1000);
+      const stopId = window.setTimeout(() => {
+        noteOff(note.pitch);
+      }, (note.startSec + note.durationSec) * 1000);
+      state.playTimeouts.push(startId, stopId);
+    });
+
+    if (ui.loopToggle.checked) {
+      state.loopTimeout = window.setTimeout(() => {
+        playImportedMidi();
+      }, state.importedMidi.durationSec * 1000 + 50);
+    }
+
+    updateTransport();
+  }
+
+  function updateTransport() {
+    if (!state.isPlaying) {
+      ui.transportStatus.textContent = '0.00 s';
+      return;
+    }
+
+    const elapsedSec = (performance.now() - state.playStartPerf) / 1000;
+    ui.transportStatus.textContent = `${elapsedSec.toFixed(2)} / ${state.playDurationSec.toFixed(2)} s`;
+
+    if (elapsedSec < state.playDurationSec + 0.05 || ui.loopToggle.checked) {
+      requestAnimationFrame(updateTransport);
+    }
+  }
+
+  function stopPlayback() {
+    state.isPlaying = false;
+    state.playTimeouts.forEach((id) => clearTimeout(id));
+    state.playTimeouts = [];
+    if (state.loopTimeout) {
+      clearTimeout(state.loopTimeout);
+      state.loopTimeout = null;
+    }
+    ui.transportStatus.textContent = '0.00 s';
+    allNotesOff();
+  }
+
+  async function handleMidiFile(file) {
+    if (!file) return;
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      state.importedMidi = parseMidi(arrayBuffer, file.name);
+      ui.fileStatus.textContent = `${file.name} / ${state.importedMidi.notes.length} notes`;
+      updateMidiSummary();
+      renderPianoRoll();
+    } catch (error) {
+      ui.fileStatus.textContent = `読込失敗: ${error.message}`;
+      console.error(error);
+    }
+  }
+
+  function clearImportedMidi() {
+    stopPlayback();
+    state.importedMidi = null;
+    state.recordedNotes = [];
+    state.recordingActiveNotes.clear();
+    ui.fileStatus.textContent = '未読込';
+    updateMidiSummary();
+    renderPianoRoll();
+  }
+
+  function wireEvents() {
+    ui.startAudioBtn.addEventListener('click', () => {
+      startAudio().catch((error) => {
+        ui.audioStatus.textContent = error.message;
+      });
+    });
+    ui.playBtn.addEventListener('click', playImportedMidi);
+    ui.stopBtn.addEventListener('click', stopPlayback);
+    ui.refreshMidiBtn.addEventListener('click', initMidi);
+    ui.clearMidiBtn.addEventListener('click', clearImportedMidi);
+    ui.midiInputSelect.addEventListener('change', (event) => setActiveMidiInput(event.target.value));
+    ui.midiFileInput.addEventListener('change', (event) => {
+      const [file] = event.target.files;
+      handleMidiFile(file);
+    });
+
+    [
+      ui.cutoff,
+      ui.resonance,
+      ui.attack,
+      ui.decay,
+      ui.sustain,
+      ui.release,
+      ui.lfoRate,
+      ui.lfoDepth,
+      ui.masterVolume,
+      ui.waveform,
+      ui.lfoTarget,
+    ].forEach((element) => {
+      element.addEventListener('input', updateOutputs);
+      element.addEventListener('change', updateOutputs);
+    });
+
+    const originalNoteOn = noteOn;
+    const originalNoteOff = noteOff;
+
+    noteOn = function patchedNoteOn(note, velocity = 100) {
+      recordManualNoteStart(note, velocity);
+      originalNoteOn(note, velocity);
+    };
+
+    noteOff = function patchedNoteOff(note) {
+      recordManualNoteStop(note);
+      originalNoteOff(note);
+    };
+  }
+
+  function init() {
+    updateOutputs();
+    createKeyboard();
+    setupPcKeyboard();
+    renderPianoRoll();
+    updateMidiSummary();
+    initMidi();
+    wireEvents();
+  }
+
+  init();
+})();
